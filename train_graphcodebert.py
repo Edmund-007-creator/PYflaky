@@ -37,7 +37,7 @@ MAX_LEN    = 512
 WINDOW_OVERLAP_TOKENS = 256   # ← 按你的建议：块大小=512（含[CLS]/[SEP]），步长=256的重叠
 LR        = 2e-5
 EPOCHS    = 5
-BATCH_TRAIN = 4               # 注意：现在一个样本里包含多个chunk，显存占用更大，建议减小batch
+BATCH_TRAIN = 2               # 注意：现在一个样本里包含多个chunk，显存占用更大，建议减小batch
 BATCH_EVAL  = 8
 SEED      = 42
 N_SPLITS  = 10
@@ -238,55 +238,51 @@ def smote_like_oversample(texts: np.ndarray, labels: np.ndarray,
                           svd_dim: int = 256,
                           k_neighbors: int = 5,
                           random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    不生成"合成文本"，而是在 TFIDF->SVD 连续空间里按“SMOTE思路”挑选少数类近邻，并复制这些真实少数类样本，直到达到目标比例。
-    返回：扩增后的 texts, labels
-    """
     rng = np.random.default_rng(random_state)
-    texts = np.asarray(texts)
-    labels = np.asarray(labels).astype(int)
+
+    # 确保 1D
+    texts = np.asarray(texts).ravel()
+    labels = np.asarray(labels, dtype=int).ravel()
 
     pos_idx = np.where(labels == 1)[0]
     neg_idx = np.where(labels == 0)[0]
     n_pos, n_neg = len(pos_idx), len(neg_idx)
 
-    # 目标少数类样本数
     n_pos_target = int(target_pos_ratio * n_neg)
     if n_pos >= n_pos_target:
-        # 已经不需要扩增
         return texts, labels
 
     n_to_add = n_pos_target - n_pos
-    # 仅在训练集上拟合（避免信息泄漏）
-    # TF-IDF -> SVD 得到 dense 连续表示
-    tfidf = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
-    X_tfidf = tfidf.fit_transform(texts[pos_idx])              # 只对少数类拟合空间也可以；若想更稳可对全体拟合
-    if X_tfidf.shape[0] < 2:
-        # 少数类太少，回退为简单复制
-        add_idx = rng.choice(pos_idx, size=n_to_add, replace=True)
-        texts_new = np.concatenate([texts, texts[add_idx]])
-        labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)])
-        return texts_new, labels_new
 
-    svd = TruncatedSVD(n_components=min(svd_dim, X_tfidf.shape[1]-1))
+    # TF-IDF → SVD（仅对少数类也可；想更稳也可改对全体拟合）
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.neighbors import NearestNeighbors
+
+    if n_pos < 2:
+        # 少数类太少，退化为简单复制
+        add_idx = rng.choice(pos_idx, size=n_to_add, replace=True)
+        return np.concatenate([texts, texts[add_idx]]), np.concatenate([labels, np.ones(n_to_add, dtype=int)])
+
+    tfidf = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
+    X_tfidf = tfidf.fit_transform(texts[pos_idx])
+    svd = TruncatedSVD(n_components=min(svd_dim, max(2, X_tfidf.shape[1]-1)))
     X_dense = svd.fit_transform(X_tfidf)
 
-    # 在少数类空间建邻居索引
     K = min(k_neighbors, max(1, X_dense.shape[0]-1))
     nn = NearestNeighbors(n_neighbors=K+1, metric="euclidean").fit(X_dense)
-    # 对每个少数类样本，取其 K 个近邻（排除自身第0位）
-    neigh = nn.kneighbors(X_dense, return_distance=False)[:, 1:]
+    neigh = nn.kneighbors(X_dense, return_distance=False)[:, 1:]  # [n_pos, K]
 
-    # 采样要复制的索引：随机挑“锚点”，并随机选一个其近邻来复制（都是真实少数类样本）
-    anchor = rng.choice(len(pos_idx), size=n_to_add, replace=True)
-    neighbor_choices = neigh[anchor]
-    pick_in_anchor_neigh = neighbor_choices[rng.integers(0, neighbor_choices.shape[1], size=n_to_add)]
-    dup_pos_idx = pos_idx[pick_in_anchor_neigh]   # 映射回全局索引
+    # 为每个要补的样本：随机挑一个 anchor（行），再在其 K 个邻居里随机选一列
+    anchors = rng.integers(0, len(pos_idx), size=n_to_add)        # [n_to_add]
+    cols    = rng.integers(0, neigh.shape[1], size=n_to_add)      # [n_to_add]
+    pick_in_anchor_neigh = neigh[anchors, cols]                   # [n_to_add] ← 一维 OK
+    dup_pos_idx = pos_idx[pick_in_anchor_neigh]                   # 映射回全局少数类索引（1D）
 
-    # 复制这些少数类样本以扩增
-    texts_new = np.concatenate([texts, texts[dup_pos_idx]])
-    labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)])
+    texts_new  = np.concatenate([texts, texts[dup_pos_idx]], axis=0)
+    labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)], axis=0)
     return texts_new, labels_new
+
 
 
 # -----------------------
