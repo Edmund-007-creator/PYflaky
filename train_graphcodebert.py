@@ -26,28 +26,32 @@ from sklearn.neighbors import NearestNeighbors
 # -----------------------
 # 超参区（可按需修改）
 # -----------------------
-MODEL_NAME = r"D:\PYFlaky\models\graphcodebert-base"
 
-# 强制 transformers 离线模式（可选但推荐）
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# === 路径与目录（相对 + 可用环境变量覆盖） ===============================
 
-MAX_LEN    = 512
-WINDOW_OVERLAP_TOKENS = 256   # ← 按你的建议：块大小=512（含[CLS]/[SEP]），步长=256的重叠
-LR        = 2e-5
-EPOCHS    = 5
-BATCH_TRAIN = 2               # 注意：现在一个样本里包含多个chunk，显存占用更大，建议减小batch
-BATCH_EVAL  = 8
-SEED      = 42
-N_SPLITS  = 10
-AGG_METHOD = "mean"           # 块级池化："mean" | "max"
-THRESH    = 0.5               # 概率阈值
-MERGE_OD_NOD = True           # 目标：OD+NOD 合并为 Flaky=1
+# 脚本所在目录 //后续创建新文件夹更改这里
+REPO_DIR = Path(__file__).resolve().parent
 
-BASE_DIR = Path(r"D:\PYFlaky")
-DATASET_PATH = BASE_DIR / "dataset" / "Python_dataset.xlsx"
-OUTPUT_DIR = BASE_DIR / "outputs"
+
+BASE_DIR = Path(os.getenv("PYFLAKY_HOME", REPO_DIR))
+
+# 本地离线模型目录（默认: <repo>/models/graphcodebert-base）
+MODEL_NAME = os.getenv(
+    "MODEL_NAME",
+    str(BASE_DIR / "models" / "graphcodebert-base")
+)
+
+# 数据集（默认: <repo>/dataset/Python_dataset.xlsx）
+DATASET_PATH = Path(os.getenv(
+    "DATASET_PATH",
+    str(BASE_DIR / "dataset" / "Python_dataset.xlsx")
+))
+
+# 输出目录（默认: <repo>/outputs）
+OUTPUT_DIR = Path(os.getenv(
+    "OUTPUT_DIR",
+    str(BASE_DIR / "outputs")
+))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 STAMP = time.strftime("%Y%m%d-%H%M%S")
@@ -58,10 +62,30 @@ dataset_path = DATASET_PATH
 model_weights_path = MODEL_WEIGHTS_PATH
 results_file = RESULTS_FILE
 
-OVERSAMPLE_METHOD = "smote_like"   # 可选: "smote_like" | "ros" | "none"
-TARGET_POS_RATIO = 1.0             # 目标：正负1:1（需要多少就补多少）
-SVD_DIM = 256                      # SMOTE风格过采样用的低维空间维度
-K_NEIGHBORS = 5                    # 少数类近邻个数（用于采样复制）
+# === Transformers 离线与并发设置 =========================================
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# === 训练超参 =============================================================
+MAX_LEN    = 512
+WINDOW_OVERLAP_TOKENS = 256
+LR        = 2e-5
+EPOCHS    = 5
+BATCH_TRAIN = 4
+BATCH_EVAL  = 8
+SEED      = 42
+N_SPLITS  = 10
+AGG_METHOD = "mean"   # "mean" | "max"
+THRESH    = 0.5
+MERGE_OD_NOD = True
+
+# === 采样与类不平衡 =======================================================
+OVERSAMPLE_METHOD = "smote_like"   # "smote_like" | "ros" | "none"
+TARGET_POS_RATIO = 1.0
+SVD_DIM = 256
+K_NEIGHBORS = 5
+
 
 # -----------------------
 # 稳定性 & 设备
