@@ -1,5 +1,15 @@
 # -*- coding: utf-8 -*-
-import os, sys, math, gc, random, time
+
+# =========================
+# 稳定显存配置（2.4.x）
+# =========================
+import os
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True"
+)
+
+import sys, math, gc, random, time, inspect, re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -8,7 +18,7 @@ from typing import List, Tuple, Dict
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler, Sampler
 
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import confusion_matrix, classification_report
@@ -17,22 +27,20 @@ from imblearn.over_sampling import RandomOverSampler
 
 from transformers import AutoTokenizer, AutoModel
 
-
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import NearestNeighbors
+
+# 统一使用 torch.amp 新接口
+from torch import amp as torch_amp
+
 
 # -----------------------
 # 超参区（可按需修改）
 # -----------------------
 
 # === 路径与目录（相对 + 可用环境变量覆盖） ===============================
-
-# 脚本所在目录 //后续创建新文件夹更改这里
 REPO_DIR = Path(__file__).resolve().parent
-
-
 BASE_DIR = Path(os.getenv("PYFLAKY_HOME", REPO_DIR))
 
 # 本地离线模型目录（默认: <repo>/models/graphcodebert-base）
@@ -67,24 +75,34 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# === 训练超参 =============================================================
-MAX_LEN    = 512
-WINDOW_OVERLAP_TOKENS = 256
-LR        = 2e-5
-EPOCHS    = 5
-BATCH_TRAIN = 4
-BATCH_EVAL  = 8
-SEED      = 42
-N_SPLITS  = 10
-AGG_METHOD = "mean"   # "mean" | "max"
-THRESH    = 0.5
-MERGE_OD_NOD = True
+# === 训练超参（稳妥默认，4090 24GB） =====================================
+MAX_LEN    = int(os.getenv("MAX_LEN", 512))
+WINDOW_OVERLAP_TOKENS = int(os.getenv("WINDOW_OVERLAP_TOKENS", 256))
+
+LR        = float(os.getenv("LR", 2e-5))
+EPOCHS    = int(os.getenv("EPOCHS", 5))
+BATCH_TRAIN = int(os.getenv("BATCH_TRAIN", 4))
+BATCH_EVAL  = int(os.getenv("BATCH_EVAL", 8))
+SEED      = int(os.getenv("SEED", 42))
+N_SPLITS  = int(os.getenv("N_SPLITS", 10))
+AGG_METHOD = os.getenv("AGG_METHOD", "mean")   # "mean" | "max"
+THRESH    = float(os.getenv("THRESH", 0.5))
+MERGE_OD_NOD = (os.getenv("MERGE_OD_NOD", "1") != "0")
 
 # === 采样与类不平衡 =======================================================
-OVERSAMPLE_METHOD = "smote_like"   # "smote_like" | "ros" | "none"
-TARGET_POS_RATIO = 1.0
-SVD_DIM = 256
-K_NEIGHBORS = 5
+OVERSAMPLE_METHOD = os.getenv("OVERSAMPLE_METHOD", "smote_like")   # "smote_like" | "ros" | "none"
+TARGET_POS_RATIO = float(os.getenv("TARGET_POS_RATIO", 1.0))
+SVD_DIM = int(os.getenv("SVD_DIM", 256))
+K_NEIGHBORS = int(os.getenv("K_NEIGHBORS", 5))
+
+# 显存相关
+GRAD_ACC_STEPS = int(os.getenv("GRAD_ACC_STEPS", 8))   # 4090 稳妥：梯度累积 8 步
+
+# 每样本最大块数（超长样本截顶）
+MAX_CHUNKS_PER_SAMPLE = int(os.getenv("MAX_CHUNKS_PER_SAMPLE", 8))  # ### [CHANGE]
+
+# encoder 前向“微批大小”（B×C 维度上的切片）
+MICRO_CHUNK = int(os.getenv("MICRO_CHUNK", 8))  # ### [CHANGE] 4090 推荐 8
 
 
 # -----------------------
@@ -99,7 +117,6 @@ def set_seed(seed=42):
 def pick_device(require_cuda=True):
     info = []
     try:
-        import torch, sys, os
         info.append(f"python: {sys.executable}")
         info.append(f"torch: {torch.__version__} (cuda runtime: {torch.version.cuda})")
         info.append(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
@@ -113,10 +130,9 @@ def pick_device(require_cuda=True):
     if require_cuda and (not torch.cuda.is_available()):
         raise RuntimeError(
             "未检测到可用 GPU。请检查：\n"
-            "1) 当前解释器是否安装了 GPU 版 torch（torch.version.cuda 应为 12.x）。\n"
-            "2) PyCharm 的 Project Interpreter 是否指向正确环境。\n"
-            "3) 是否设置了 CUDA_VISIBLE_DEVICES 导致隐藏了 GPU。\n"
-            "4) 若网络受限，确认不是装成 CPU 轮子；必要时用离线 whl 安装 cu121/cu122 版本。\n"
+            "1) 是否安装 GPU 版 torch；\n"
+            "2) 解释器环境是否正确；\n"
+            "3) CUDA_VISIBLE_DEVICES 是否隐藏了 GPU；\n"
         )
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -167,6 +183,7 @@ def encode_chunks_per_texts(
     tokenizer: AutoTokenizer,
     max_len: int = 512,
     overlap_tokens: int = 256,
+    cap_chunks: int = MAX_CHUNKS_PER_SAMPLE,  # ### [CHANGE]
 ) -> List[Dict[str, torch.Tensor]]:
     """对每条 text 产生若干 chunk：每个 chunk 是 [seq_len] 的 input_ids/attention_mask。
        返回列表长度 = 样本数；每个元素包含：
@@ -180,7 +197,6 @@ def encode_chunks_per_texts(
         ids = tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
         chunk_inputs = []
         if len(ids) == 0:
-            # 空文本：构造仅含special tokens的一块
             piece_ids = tokenizer.build_inputs_with_special_tokens([])
             attn = [1] * len(piece_ids)
             if len(piece_ids) > max_len:
@@ -209,9 +225,12 @@ def encode_chunks_per_texts(
                     torch.tensor(piece_ids, dtype=torch.long),
                     torch.tensor(attn, dtype=torch.long)
                 ))
+                # ### [CHANGE] 截顶每样本最大块数
+                if len(chunk_inputs) >= cap_chunks:
+                    break
 
-        X_ids  = torch.stack([ci[0] for ci in chunk_inputs], dim=0)   # [num_chunks, max_len]
-        X_mask = torch.stack([ci[1] for ci in chunk_inputs], dim=0)   # [num_chunks, max_len]
+        X_ids  = torch.stack([ci[0] for ci in chunk_inputs], dim=0)   # [C, L]
+        X_mask = torch.stack([ci[1] for ci in chunk_inputs], dim=0)   # [C, L]
         out.append({"input_ids": X_ids, "attention_mask": X_mask})
     return out
 
@@ -253,7 +272,6 @@ def collate_owner_batch(batch):
     labels = torch.stack(labels, dim=0)
     return pad_ids, pad_mask, chunk_mask, labels
 
-
 # -----------------------
 # smote 过采样
 # -----------------------
@@ -278,13 +296,7 @@ def smote_like_oversample(texts: np.ndarray, labels: np.ndarray,
 
     n_to_add = n_pos_target - n_pos
 
-    # TF-IDF → SVD（仅对少数类也可；想更稳也可改对全体拟合）
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.decomposition import TruncatedSVD
-    from sklearn.neighbors import NearestNeighbors
-
     if n_pos < 2:
-        # 少数类太少，退化为简单复制
         add_idx = rng.choice(pos_idx, size=n_to_add, replace=True)
         return np.concatenate([texts, texts[add_idx]]), np.concatenate([labels, np.ones(n_to_add, dtype=int)])
 
@@ -297,59 +309,154 @@ def smote_like_oversample(texts: np.ndarray, labels: np.ndarray,
     nn = NearestNeighbors(n_neighbors=K+1, metric="euclidean").fit(X_dense)
     neigh = nn.kneighbors(X_dense, return_distance=False)[:, 1:]  # [n_pos, K]
 
-    # 为每个要补的样本：随机挑一个 anchor（行），再在其 K 个邻居里随机选一列
-    anchors = rng.integers(0, len(pos_idx), size=n_to_add)        # [n_to_add]
-    cols    = rng.integers(0, neigh.shape[1], size=n_to_add)      # [n_to_add]
-    pick_in_anchor_neigh = neigh[anchors, cols]                   # [n_to_add] ← 一维 OK
-    dup_pos_idx = pos_idx[pick_in_anchor_neigh]                   # 映射回全局少数类索引（1D）
+    anchors = rng.integers(0, len(pos_idx), size=n_to_add)
+    cols    = rng.integers(0, neigh.shape[1], size=n_to_add)
+    pick_in_anchor_neigh = neigh[anchors, cols]
+    dup_pos_idx = pos_idx[pick_in_anchor_neigh]
 
     texts_new  = np.concatenate([texts, texts[dup_pos_idx]], axis=0)
     labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)], axis=0)
     return texts_new, labels_new
 
-
+# -----------------------
+# BatchSampler：按“块数”排序分桶，避免长短混编  ### [CHANGE]
+# -----------------------
+def build_bucketed_batch_sampler(chunks_per_sample, batch_size: int):
+    lengths = [d["input_ids"].size(0) for d in chunks_per_sample]
+    idx_sorted = np.argsort(lengths)  # 由短到长
+    batches = [idx_sorted[i:i+batch_size] for i in range(0, len(idx_sorted), batch_size)]
+    class FixedBatchSampler(Sampler):
+        def __init__(self, batches): self.batches = [list(map(int, b)) for b in batches]
+        def __iter__(self): return iter(self.batches)
+        def __len__(self): return len(self.batches)
+    return FixedBatchSampler(batches)
 
 # -----------------------
-# 模型：编码器 + 块维度池化 + 线性头
+# autocast / GradScaler 兼容封装  ### [CHANGE]
+# -----------------------
+def _make_grad_scaler(enabled: bool):
+    try:
+        sig = inspect.signature(torch_amp.GradScaler)
+        if 'device_type' in sig.parameters:
+            return torch_amp.GradScaler(device_type="cuda", enabled=enabled)
+        else:
+            return torch_amp.GradScaler(enabled=enabled)
+    except Exception:
+        from torch.cuda.amp import GradScaler as CudaGradScaler
+        return CudaGradScaler(enabled=enabled)
+
+class AutocastCUDA:
+    def __init__(self, dtype):
+        self.dtype = dtype
+        self.ctx = None
+    def __enter__(self):
+        try:
+            self.ctx = torch_amp.autocast(device_type="cuda", dtype=self.dtype)
+        except TypeError:
+            from torch.cuda.amp import autocast as cuda_autocast
+            self.ctx = cuda_autocast(dtype=self.dtype)
+        return self.ctx.__enter__()
+    def __exit__(self, exc_type, exc, tb):
+        return self.ctx.__exit__(exc_type, exc, tb)
+
+# -----------------------
+# 模型：编码器 + 块维度池化 + 线性头（分块前向 + AMP）
 # -----------------------
 class ChunkedClassifier(nn.Module):
-    def __init__(self, model_name: str, num_labels: int = 2, agg: str = "mean"):
+    def __init__(self, model_name: str, num_labels: int = 2, agg: str = "mean",
+                 micro_chunk: int = 32, use_checkpoint: bool = True):  # ### [CHANGE]
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name, local_files_only=True)
+        if use_checkpoint and hasattr(self.encoder, "gradient_checkpointing_enable"):
+            self.encoder.gradient_checkpointing_enable()  # ### [CHANGE]
+
         hidden = self.encoder.config.hidden_size
         self.classifier = nn.Linear(hidden, num_labels)
         assert agg in {"mean", "max"}
         self.agg = agg
+        self.micro_chunk = micro_chunk  # (B×C) 维上的微批大小
 
     def forward(self, input_ids, attention_mask, chunk_mask):
         """
-        input_ids:   [B, C, L]
-        attention_mask: [B, C, L]
-        chunk_mask:  [B, C]  -> 哪些块有效
+        input_ids:     [B, C, L]   # 在 CPU
+        attention_mask:[B, C, L]   # 在 CPU
+        chunk_mask:    [B, C]      # 在 CPU
         """
         B, C, L = input_ids.size()
+        device = next(self.parameters()).device
+        H = self.encoder.config.hidden_size
+
+        # 在 CPU reshape，避免将整批搬上 GPU  ### [CHANGE]
         x_ids = input_ids.view(B*C, L)
         x_att = attention_mask.view(B*C, L)
+        flat_valid = chunk_mask.view(-1)  # [B*C] (CPU)
 
-        outputs = self.encoder(input_ids=x_ids, attention_mask=x_att, return_dict=True)
-        # 取每个块的 [CLS] 向量
-        cls = outputs.last_hidden_state[:, 0, :]             # [B*C, H]
-        H = cls.size(-1)
-        cls = cls.view(B, C, H)                              # [B, C, H]
+        # 输出累积容器（GPU）
+        pooled_sum = torch.zeros(B, H, dtype=torch.float32, device=device)
+        pooled_cnt = torch.zeros(B, 1, dtype=torch.float32, device=device)
+        if self.agg == "max":
+            pooled_max = torch.full((B, H), torch.finfo(torch.float32).min,
+                                    dtype=torch.float32, device=device)
 
-        # mask 无效块
-        mask = chunk_mask.unsqueeze(-1).to(cls.dtype)        # [B, C, 1]
+        # AMP 精度
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+
+        start = 0
+        while start < B*C:
+            end = min(start + self.micro_chunk, B*C)
+            # 在 GPU 构造索引；占用小
+            idx_range = torch.arange(start, end, device=device)
+            sample_idx = torch.div(idx_range, C, rounding_mode='floor')  # [m]
+
+            # 该微批在 CPU 的有效位（bool）
+            valid_here = flat_valid[start:end]
+            if valid_here.sum().item() == 0:
+                start = end
+                continue
+
+            # 仅搬这一小段到 GPU  ### [CHANGE]
+            ids_mb  = x_ids[start:end].to(device, non_blocking=True)
+            att_mb  = x_att[start:end].to(device, non_blocking=True)
+
+            with AutocastCUDA(amp_dtype):
+                out = self.encoder(
+                    input_ids=ids_mb,
+                    attention_mask=att_mb,
+                    return_dict=True
+                )
+                cls = out.last_hidden_state[:, 0, :]   # [m, H] (amp dtype, GPU)
+
+            # 有效位置（注意：valid_here 在 CPU，要转到 GPU）
+            mask_idx = torch.nonzero(valid_here.to(device), as_tuple=False).squeeze(-1)
+            if mask_idx.numel() == 0:
+                start = end
+                continue
+
+            cls_valid = cls.index_select(0, mask_idx).to(torch.float32)           # [k, H]
+            samp_valid = sample_idx.index_select(0, mask_idx)                     # [k]
+
+            pooled_sum.index_add_(0, samp_valid, cls_valid)                       # sum
+            add_cnt = torch.ones((mask_idx.numel(), 1), dtype=torch.float32, device=device)
+            pooled_cnt.index_add_(0, samp_valid, add_cnt)                         # count
+
+            if self.agg == "max":
+                for s in samp_valid.unique():
+                    sel = (samp_valid == s).nonzero(as_tuple=False).squeeze(-1)
+                    cur = cls_valid.index_select(0, sel)
+                    pooled_max[s] = torch.maximum(pooled_max[s], cur.max(dim=0).values)
+
+            # 释放本微批临时张量
+            del ids_mb, att_mb, out, cls, cls_valid, samp_valid, mask_idx
+            start = end
 
         if self.agg == "mean":
-            summed = (cls * mask).sum(dim=1)                 # [B, H]
-            denom = mask.sum(dim=1).clamp(min=1e-6)          # [B, 1]
-            pooled = summed / denom
-        else:  # max
-            neg_inf = torch.finfo(cls.dtype).min
-            cls_masked = cls.masked_fill(chunk_mask.unsqueeze(-1)==False, neg_inf)
-            pooled, _ = torch.max(cls_masked, dim=1)         # [B, H]
+            denom = pooled_cnt.clamp(min=1e-6)
+            pooled = pooled_sum / denom
+        else:
+            pooled = pooled_max
 
-        logits = self.classifier(pooled)                     # [B, num_labels]
+        logits = self.classifier(pooled)               # [B, num_labels]
         return logits
 
 # -----------------------
@@ -398,7 +505,7 @@ def main():
 
     X = df[code_col].values
 
-    # tokenizer（把 model_max_length 拉大，实际我们手动切到 MAX_LEN）
+    # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
     tokenizer.model_max_length = int(1e9)
     print(f"[{now()}] 已加载本地 tokenizer，model_max_length={tokenizer.model_max_length}")
@@ -435,27 +542,20 @@ def main():
                 k_neighbors=K_NEIGHBORS,
                 random_state=SEED
             )
-            print(
-                f"[{now()}] SMOTE-like 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+            print(f"[{now()}] SMOTE-like 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
         elif OVERSAMPLE_METHOD == "ros":
-            from imblearn.over_sampling import RandomOverSampler
             ros = RandomOverSampler(sampling_strategy="minority", random_state=SEED)
             X_train_os, y_train_os = ros.fit_resample(X_train.reshape(-1, 1), y_train.reshape(-1, 1))
-            X_train_os = X_train_os.ravel();
-            y_train_os = y_train_os.ravel()
-            print(
-                f"[{now()}] ROS 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+            X_train_os = X_train_os.ravel(); y_train_os = y_train_os.ravel()
+            print(f"[{now()}] ROS 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
         else:
             X_train_os, y_train_os = X_train, y_train
-            print(
-                f"[{now()}] 不做过采样：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+            print(f"[{now()}] 不做过采样：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
 
-
-
-        # === 编码为“每样本多个块” ===
-        train_chunks = encode_chunks_per_texts(list(X_train_os), tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS)
-        val_chunks   = encode_chunks_per_texts(list(X_val),      tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS)
-        test_chunks  = encode_chunks_per_texts(list(X_test),     tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS)
+        # === 编码为“每样本多个块”（含截顶） ===  ### [CHANGE]
+        train_chunks = encode_chunks_per_texts(list(X_train_os), tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS, MAX_CHUNKS_PER_SAMPLE)
+        val_chunks   = encode_chunks_per_texts(list(X_val),      tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS, MAX_CHUNKS_PER_SAMPLE)
+        test_chunks  = encode_chunks_per_texts(list(X_test),     tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS, MAX_CHUNKS_PER_SAMPLE)
         print(f"[{now()}] 块计数（示例）：train[0] chunks = {train_chunks[0]['input_ids'].size(0)}")
 
         # 构建样本级 Dataset
@@ -463,11 +563,13 @@ def main():
         val_ds   = OwnerChunkDataset(val_chunks,   list(y_val))
         test_ds  = OwnerChunkDataset(test_chunks,  list(y_test))
 
-        # DataLoader
+        # === 分桶 BatchSampler（避免长短混编） ===  ### [CHANGE]
+        train_batch_sampler = build_bucketed_batch_sampler(train_chunks, BATCH_TRAIN)
+
+        # DataLoader（注意：不整体上卡）
         g = torch.Generator(); g.manual_seed(SEED)
-        train_loader = DataLoader(train_ds, sampler=RandomSampler(train_ds),
-                                  batch_size=BATCH_TRAIN, generator=g, num_workers=0,
-                                  collate_fn=collate_owner_batch)
+        train_loader = DataLoader(train_ds, batch_sampler=train_batch_sampler,
+                                  generator=g, num_workers=0, collate_fn=collate_owner_batch)
         val_loader   = DataLoader(val_ds, sampler=SequentialSampler(val_ds),
                                   batch_size=BATCH_EVAL, generator=g, num_workers=0,
                                   collate_fn=collate_owner_batch)
@@ -476,7 +578,8 @@ def main():
                                   collate_fn=collate_owner_batch)
 
         # 模型 & 损失
-        model = ChunkedClassifier(MODEL_NAME, num_labels=2, agg=AGG_METHOD).to(device)
+        model = ChunkedClassifier(MODEL_NAME, num_labels=2, agg=AGG_METHOD,
+                                  micro_chunk=MICRO_CHUNK, use_checkpoint=True).to(device)  # ### [CHANGE]
 
         classes = np.array([0, 1])
         try:
@@ -488,12 +591,16 @@ def main():
         print(f"[{now()}] 类权重（基于过采样前分布）：{class_weights.tolist()}")
 
         criterion = nn.CrossEntropyLoss(weight=weight_tensor, reduction="mean")
-
-
         optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
         best_val_f1 = -1.0
         best_state = None
+
+        # AMP / TF32 设置
+        use_bf16_amp = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        scaler = _make_grad_scaler(enabled=not use_bf16_amp)  # ### [CHANGE]
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
         # 训练
         for epoch in range(EPOCHS):
@@ -502,28 +609,44 @@ def main():
             tr_loss = 0.0
             train_correct = 0
             train_total = 0
+            optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(train_loader, start=1):
-                ids, attn, c_mask, labels = batch
-                ids = ids.to(device); attn = attn.to(device)
-                c_mask = c_mask.to(device); labels = labels.to(device)
+                ids, attn, c_mask, labels = batch   # 全在 CPU
+                labels = labels.to(device, non_blocking=True)  # 仅 labels 上卡  ### [CHANGE]
 
-                optimizer.zero_grad()
-                logits = model(ids, attn, c_mask)         # [B,2]
-                loss = criterion(logits, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                tr_loss += loss.item()
+                with AutocastCUDA(torch.bfloat16 if use_bf16_amp else torch.float16):
+                    logits = model(ids, attn, c_mask)  # forward 内部微批上卡  ### [CHANGE]
+                    loss = criterion(logits, labels) / GRAD_ACC_STEPS
+
+                if use_bf16_amp:
+                    loss.backward()
+                else:
+                    scaler.scale(loss).backward()
 
                 with torch.no_grad():
                     preds = torch.argmax(logits, dim=-1)
                     train_correct += (preds == labels).sum().item()
                     train_total += labels.size(0)
 
+                if step % GRAD_ACC_STEPS == 0:
+                    if use_bf16_amp:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                    else:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                tr_loss += loss.item() * GRAD_ACC_STEPS
                 if step % 200 == 0:
-                    print(f"[{now()}]   epoch {epoch+1} step {step}/{len(train_loader)} | "
-                          f"avg_loss={tr_loss/step:.4f} | train_acc={train_correct/max(1,train_total):.4f}")
+                    print(f"[{now()}]   epoch {epoch + 1} step {step}/{len(train_loader)} | "
+                          f"avg_loss={tr_loss / max(1, step):.4f} | train_acc={train_correct / max(1, train_total):.4f}")
+
+                # 及时释放 CPU batch，减少峰值
+                del ids, attn, c_mask, labels, logits, loss
 
             tr_loss /= max(1, len(train_loader))
             train_acc = train_correct / max(1, train_total)
@@ -534,14 +657,17 @@ def main():
             with torch.no_grad():
                 for batch in val_loader:
                     ids, attn, c_mask, labels = batch
-                    ids = ids.to(device); attn = attn.to(device); c_mask = c_mask.to(device)
-                    logits = model(ids, attn, c_mask)
-                    probs = torch.softmax(logits, dim=-1)[:,1].detach().cpu().numpy()
+                    labels = labels.to(device, non_blocking=True)
+                    with AutocastCUDA(torch.bfloat16 if use_bf16_amp else torch.float16):
+                        logits = model(ids, attn, c_mask)
+                        probs = torch.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
                     y_val_pred.extend((probs >= THRESH).astype(int).tolist())
-            tn, fp, fn, tp = confusion_matrix(y_val, y_val_pred, labels=[0,1]).ravel()
+                    del ids, attn, c_mask, labels, logits
+
+            tn, fp, fn, tp = confusion_matrix(y_val, y_val_pred, labels=[0, 1]).ravel()
             acc, f1, prec, rec = compute_scores(tn, fp, fn, tp)
             elapse = time.time() - ep_t0
-            print(f"[{now()}] Epoch {epoch+1}/{EPOCHS} | "
+            print(f"[{now()}] Epoch {epoch + 1}/{EPOCHS} | "
                   f"train_acc={train_acc:.4f} train_loss={tr_loss:.4f} | "
                   f"val_acc={acc:.4f} val_f1={f1:.4f} p={prec:.4f} r={rec:.4f} | {elapse:.1f}s")
 
@@ -566,10 +692,12 @@ def main():
         with torch.no_grad():
             for batch in test_loader:
                 ids, attn, c_mask, labels = batch
-                ids = ids.to(device); attn = attn.to(device); c_mask = c_mask.to(device)
-                logits = model(ids, attn, c_mask)
-                probs = torch.softmax(logits, dim=-1)[:,1].detach().cpu().numpy()
+                labels = labels.to(device, non_blocking=True)
+                with AutocastCUDA(torch.bfloat16 if use_bf16_amp else torch.float16):
+                    logits = model(ids, attn, c_mask)
+                    probs = torch.softmax(logits, dim=-1)[:,1].detach().cpu().numpy()
                 y_test_pred.extend((probs >= THRESH).astype(int).tolist())
+                del ids, attn, c_mask, labels, logits
 
         print(f"[{now()}] 测试集报告（样本级）：")
         print(classification_report(y_test, y_test_pred, digits=4))
@@ -601,6 +729,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
