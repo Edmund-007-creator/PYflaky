@@ -15,7 +15,13 @@ from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import RandomOverSampler
 
-from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModel
+
+
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.neighbors import NearestNeighbors
 
 # -----------------------
 # 超参区（可按需修改）
@@ -51,6 +57,11 @@ RESULTS_FILE = OUTPUT_DIR / f"results_{STAMP}.csv"
 dataset_path = DATASET_PATH
 model_weights_path = MODEL_WEIGHTS_PATH
 results_file = RESULTS_FILE
+
+OVERSAMPLE_METHOD = "smote_like"   # 可选: "smote_like" | "ros" | "none"
+TARGET_POS_RATIO = 1.0             # 目标：正负1:1（需要多少就补多少）
+SVD_DIM = 256                      # SMOTE风格过采样用的低维空间维度
+K_NEIGHBORS = 5                    # 少数类近邻个数（用于采样复制）
 
 # -----------------------
 # 稳定性 & 设备
@@ -218,6 +229,66 @@ def collate_owner_batch(batch):
     labels = torch.stack(labels, dim=0)
     return pad_ids, pad_mask, chunk_mask, labels
 
+
+# -----------------------
+# smote 过采样
+# -----------------------
+def smote_like_oversample(texts: np.ndarray, labels: np.ndarray,
+                          target_pos_ratio: float = 1.0,
+                          svd_dim: int = 256,
+                          k_neighbors: int = 5,
+                          random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    不生成"合成文本"，而是在 TFIDF->SVD 连续空间里按“SMOTE思路”挑选少数类近邻，并复制这些真实少数类样本，直到达到目标比例。
+    返回：扩增后的 texts, labels
+    """
+    rng = np.random.default_rng(random_state)
+    texts = np.asarray(texts)
+    labels = np.asarray(labels).astype(int)
+
+    pos_idx = np.where(labels == 1)[0]
+    neg_idx = np.where(labels == 0)[0]
+    n_pos, n_neg = len(pos_idx), len(neg_idx)
+
+    # 目标少数类样本数
+    n_pos_target = int(target_pos_ratio * n_neg)
+    if n_pos >= n_pos_target:
+        # 已经不需要扩增
+        return texts, labels
+
+    n_to_add = n_pos_target - n_pos
+    # 仅在训练集上拟合（避免信息泄漏）
+    # TF-IDF -> SVD 得到 dense 连续表示
+    tfidf = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
+    X_tfidf = tfidf.fit_transform(texts[pos_idx])              # 只对少数类拟合空间也可以；若想更稳可对全体拟合
+    if X_tfidf.shape[0] < 2:
+        # 少数类太少，回退为简单复制
+        add_idx = rng.choice(pos_idx, size=n_to_add, replace=True)
+        texts_new = np.concatenate([texts, texts[add_idx]])
+        labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)])
+        return texts_new, labels_new
+
+    svd = TruncatedSVD(n_components=min(svd_dim, X_tfidf.shape[1]-1))
+    X_dense = svd.fit_transform(X_tfidf)
+
+    # 在少数类空间建邻居索引
+    K = min(k_neighbors, max(1, X_dense.shape[0]-1))
+    nn = NearestNeighbors(n_neighbors=K+1, metric="euclidean").fit(X_dense)
+    # 对每个少数类样本，取其 K 个近邻（排除自身第0位）
+    neigh = nn.kneighbors(X_dense, return_distance=False)[:, 1:]
+
+    # 采样要复制的索引：随机挑“锚点”，并随机选一个其近邻来复制（都是真实少数类样本）
+    anchor = rng.choice(len(pos_idx), size=n_to_add, replace=True)
+    neighbor_choices = neigh[anchor]
+    pick_in_anchor_neigh = neighbor_choices[rng.integers(0, neighbor_choices.shape[1], size=n_to_add)]
+    dup_pos_idx = pos_idx[pick_in_anchor_neigh]   # 映射回全局索引
+
+    # 复制这些少数类样本以扩增
+    texts_new = np.concatenate([texts, texts[dup_pos_idx]])
+    labels_new = np.concatenate([labels, np.ones(n_to_add, dtype=int)])
+    return texts_new, labels_new
+
+
 # -----------------------
 # 模型：编码器 + 块维度池化 + 线性头
 # -----------------------
@@ -335,12 +406,31 @@ def main():
             fold_idx += 1
             continue
 
-        # 过采样（对“样本”级别，而非窗口级）
-        ros = RandomOverSampler(sampling_strategy="minority", random_state=SEED)
-        X_train_os, y_train_os = ros.fit_resample(X_train.reshape(-1,1), y_train.reshape(-1,1))
-        X_train_os = X_train_os.ravel()
-        y_train_os = y_train_os.ravel()
-        print(f"[{now()}] 过采样后：train={len(X_train_os)}（正负均衡）")
+        # 过采样（基于开关）
+        if OVERSAMPLE_METHOD == "smote_like":
+            X_train_os, y_train_os = smote_like_oversample(
+                X_train, y_train,
+                target_pos_ratio=TARGET_POS_RATIO,
+                svd_dim=SVD_DIM,
+                k_neighbors=K_NEIGHBORS,
+                random_state=SEED
+            )
+            print(
+                f"[{now()}] SMOTE-like 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+        elif OVERSAMPLE_METHOD == "ros":
+            from imblearn.over_sampling import RandomOverSampler
+            ros = RandomOverSampler(sampling_strategy="minority", random_state=SEED)
+            X_train_os, y_train_os = ros.fit_resample(X_train.reshape(-1, 1), y_train.reshape(-1, 1))
+            X_train_os = X_train_os.ravel();
+            y_train_os = y_train_os.ravel()
+            print(
+                f"[{now()}] ROS 过采样后：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+        else:
+            X_train_os, y_train_os = X_train, y_train
+            print(
+                f"[{now()}] 不做过采样：train={len(X_train_os)} | pos={int((y_train_os == 1).sum())} neg={int((y_train_os == 0).sum())}")
+
+
 
         # === 编码为“每样本多个块” ===
         train_chunks = encode_chunks_per_texts(list(X_train_os), tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS)
@@ -370,14 +460,16 @@ def main():
 
         classes = np.array([0, 1])
         try:
-            class_weights = compute_class_weight('balanced', classes=classes, y=y_train_os)
+            class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
         except Exception as e:
             class_weights = np.array([1.0, 1.0], dtype=np.float32)
             print(f"[{now()}] [WARN] compute_class_weight 失败，使用均等权重。{e}")
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
-        print(f"[{now()}] 类权重：{class_weights.tolist()}")
+        print(f"[{now()}] 类权重（基于过采样前分布）：{class_weights.tolist()}")
 
-        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor, reduction="mean")
+
+
         optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
         best_val_f1 = -1.0
