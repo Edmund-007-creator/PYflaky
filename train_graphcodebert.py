@@ -26,6 +26,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import RandomOverSampler
 
 from transformers import AutoTokenizer, AutoModel
+from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
@@ -44,7 +45,7 @@ REPO_DIR = Path(__file__).resolve().parent
 BASE_DIR = Path(os.getenv("PYFLAKY_HOME", REPO_DIR))
 
 MODEL_NAME = os.getenv("MODEL_NAME", str(BASE_DIR / "models" / "graphcodebert-base"))
-DATASET_PATH = Path(os.getenv("DATASET_PATH", str(BASE_DIR / "dataset" / "Python_dataset.xlsx")))
+DATASET_PATH = Path(os.getenv("DATASET_PATH", str(BASE_DIR / "dataset" / "Flakify_FlakeFlagger_dataset.csv")))
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,12 +62,16 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# === 数据集类型：python | java  （决定列名、提示与规则）===
+DATASET_KIND = os.getenv("DATASET_KIND", "python").strip().lower()
+assert DATASET_KIND in {"python", "java"}, "DATASET_KIND 必须是 python 或 java"
+
 # === 训练超参（4090 24GB 稳妥默认） =======================================
 MAX_LEN    = int(os.getenv("MAX_LEN", 512))
 WINDOW_OVERLAP_TOKENS = int(os.getenv("WINDOW_OVERLAP_TOKENS", 256))
 
 LR        = float(os.getenv("LR", 2e-5))
-EPOCHS    = int(os.getenv("EPOCHS", 5))
+EPOCHS    = int(os.getenv("EPOCHS", 15))                 # ↑ 放大到 15，交给 early stopping 控
 BATCH_TRAIN = int(os.getenv("BATCH_TRAIN", 4))
 BATCH_EVAL  = int(os.getenv("BATCH_EVAL", 8))
 SEED      = int(os.getenv("SEED", 42))
@@ -75,23 +80,33 @@ AGG_METHOD = os.getenv("AGG_METHOD", "mean")   # "mean" | "max"
 MERGE_OD_NOD = (os.getenv("MERGE_OD_NOD", "1") != "0")
 
 # === 不平衡处理（默认只用类权重；需要过采样再改这里） =========================
-OVERSAMPLE_METHOD = os.getenv("OVERSAMPLE_METHOD", "none")   # "smote_like" | "ros" | "none"  ### [CHANGE]
+OVERSAMPLE_METHOD = os.getenv("OVERSAMPLE_METHOD", "none")   # "smote_like" | "ros" | "none"
 TARGET_POS_RATIO = float(os.getenv("TARGET_POS_RATIO", 0.5)) # 若 smote/ros，用 0.5 更稳
 SVD_DIM = int(os.getenv("SVD_DIM", 256))
 K_NEIGHBORS = int(os.getenv("K_NEIGHBORS", 5))
 
 # === 显存相关（微批 + 累积） ===============================================
 GRAD_ACC_STEPS = int(os.getenv("GRAD_ACC_STEPS", 8))
-MAX_CHUNKS_PER_SAMPLE = int(os.getenv("MAX_CHUNKS_PER_SAMPLE", 8))   # ### [CHANGE]
-MICRO_CHUNK = int(os.getenv("MICRO_CHUNK", 8))                       # ### [CHANGE]
+MAX_CHUNKS_PER_SAMPLE = int(os.getenv("MAX_CHUNKS_PER_SAMPLE", 8))
+MICRO_CHUNK = int(os.getenv("MICRO_CHUNK", 8))
 
-# === 任务提示（固定 Prompt + 可选 Auto-Hint） ==============================
+# === 任务提示（固定 Prompt + 可选 Auto-Hint）===  （1=开，0=关）
 USE_TASK_PROMPT = (os.getenv("USE_TASK_PROMPT", "1") != "0")
 PROMPT_LANG     = os.getenv("PROMPT_LANG", "en")        # "en" 或 "zh"
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", 260))
 
 USE_AUTO_HINT   = (os.getenv("USE_AUTO_HINT", "1") != "0")
 MAX_AUTO_HINT_CHARS = int(os.getenv("MAX_AUTO_HINT_CHARS", 120))
+
+# === 新增：调度与提前停止 ===
+WARMUP_RATIO = float(os.getenv("WARMUP_RATIO", 0.06))   # 5~10% 都可
+SCHEDULER = os.getenv("SCHEDULER", "cosine")            # "cosine" 或 "linear"
+PATIENCE = int(os.getenv("PATIENCE", 3))                # 连续 N 个 epoch 无提升则停
+MIN_DELTA = float(os.getenv("MIN_DELTA", 1e-3))         # 认为“有提升”的最小幅度
+
+# === 新增：两层 MLP 头部超参 ===
+HEAD_HIDDEN = int(os.getenv("HEAD_HIDDEN", 512))
+HEAD_DROPOUT = float(os.getenv("HEAD_DROPOUT", 0.1))
 
 
 # -----------------------
@@ -148,8 +163,27 @@ def load_dataset_any(path: Path) -> pd.DataFrame:
 
 
 # -----------------------
-# 标签映射
+# 列名选择 & 标签映射
 # -----------------------
+def pick_cols(df: pd.DataFrame, kind: str) -> Tuple[str, str]:
+    lower2orig = {c.lower(): c for c in df.columns}
+    if kind == "java":
+        label_candidates = ["flaky"]  # Java 固定用 flaky
+    else:
+        label_candidates = ["flaky", "is_flaky", "label"]
+    label_key = next((k for k in label_candidates if k in lower2orig), None)
+    if label_key is None:
+        raise ValueError(f"未找到标签列（{kind} 期望之一：{label_candidates}，不区分大小写）")
+    label_col = lower2orig[label_key]
+
+    code_priority = ["final_code", "extractedcode", "code"] if kind == "java" \
+                    else ["extractedcode", "final_code", "code"]
+    code_key = next((k for k in code_priority if k in lower2orig), None)
+    if code_key is None:
+        raise ValueError(f"未找到代码列（{kind} 期望之一：{code_priority}，不区分大小写）")
+    code_col = lower2orig[code_key]
+    return code_col, label_col
+
 def map_label_merge(x: str) -> int:
     s = str(x).strip().lower()
     if s in {"od", "nod", "flaky", "is_flaky", "yes", "1", "true"}: return 1
@@ -163,70 +197,90 @@ def map_label_separate(x: str) -> int:
     return 0
 
 
-
-# ===== Python 专用 Task Prompt（替换原 PROMPT_EN / PROMPT_ZH）=====
-PROMPT_EN = (
-    "Task: Decide if the following *Python* unit test is FLAKY (binary classification: 1=flaky, 0=not-flaky). "
-    "Common flaky patterns: timing/sleep/timeouts; async/await concurrency races; order-dependence between tests; "
-    "unseeded randomness; network/HTTP or external services; filesystem/temporary dirs; system clock/timezone dependence; "
-    "shared module-level/global state; environment variables/config differences; external processes/subprocess; UI/webdriver."
-)
-PROMPT_ZH = (
-    "任务：判断下面的 *Python* 单元测试是否为 Flaky（1=Flaky，0=非Flaky）。"
-    "常见 Flaky 模式包括：时序/休眠/超时、async/await 并发竞态、测试间执行顺序依赖、未固定随机数、"
-    "网络/HTTP 或外部服务依赖、文件系统/临时目录、系统时钟/时区依赖、模块/全局共享状态、环境变量/配置差异、"
-    "外部进程/子进程、UI/WebDriver 等。"
-)
+# -----------------------
+# 任务提示（按数据集类型切换）
+# -----------------------
+PROMPTS = {
+    "python": {
+        "en": (
+            "Task: Decide if the following *Python* unit test is FLAKY (1=flaky, 0=not-flaky). "
+            "Common flaky patterns: timing/sleep/timeouts; async/await races; order dependence; "
+            "unseeded randomness; network/HTTP or external services; filesystem/tmp dirs; "
+            "system clock/timezone; shared global/module state; env/config diffs; subprocess; UI/webdriver."
+        ),
+        "zh": (
+            "任务：判断下面的 *Python* 单元测试是否为 Flaky（1=Flaky，0=非Flaky）。"
+            "常见 Flaky 模式：时序/休眠/超时、async/await 竞态、测试顺序依赖、未固定随机数、"
+            "网络/HTTP 或外部服务、文件系统/临时目录、系统时钟/时区、模块/全局共享状态、"
+            "环境变量/配置差异、子进程、UI/WebDriver 等。"
+        )
+    },
+    "java": {
+        "en": (
+            "Task: Decide if the following *Java* unit test is FLAKY (1=flaky, 0=not-flaky). "
+            "Common flaky patterns: timing/Thread.sleep/timeouts/Awaitility; async/concurrency races "
+            "(Future/CompletableFuture/executors); order dependence (JUnit/TestNG); unseeded randomness; "
+            "network/HTTP/external services; filesystem; system clock; shared static/global state; "
+            "env/config differences; mocks flakiness; UI/WebDriver."
+        ),
+        "zh": (
+            "任务：判断下面的 *Java* 单元测试是否为 Flaky（1=Flaky，0=非Flaky）。"
+            "常见 Flaky 模式：时序/Thread.sleep/超时/Awaitility，异步/并发竞态（Future/CompletableFuture/线程池），"
+            "JUnit/TestNG 的顺序依赖、未固定随机数、网络/HTTP/外部服务、文件系统、系统时钟、"
+            "静态/全局共享状态、环境/配置差异、Mock 不稳定、UI/WebDriver 等。"
+        )
+    }
+}
 
 def _task_prompt_text():
-    base = PROMPT_ZH if PROMPT_LANG.lower().startswith("zh") else PROMPT_EN
+    lang = "zh" if PROMPT_LANG.lower().startswith("zh") else "en"
+    base = PROMPTS[DATASET_KIND][lang]
     return base[:MAX_PROMPT_CHARS]
 
-# ===== Python 专用 Auto-Hint 规则（替换原 _HINT_PATTERNS）=====
-_HINT_PATTERNS = [
-    # 时序/超时
+_HINT_PATTERNS_PY = [
     (r"\btime\.sleep\(", "timing/sleep"),
     (r"\basyncio\.sleep\(", "timing/async-sleep"),
     (r"\bpytest\.mark\.timeout\b", "timeout"),
-
-    # 异步/并发
     (r"\bpytest\.mark\.asyncio\b|\basyncio\b|\btrio\b|\banyio\b", "async/asyncio"),
     (r"\bthreading\.(Thread|Lock|Event|Condition|Semaphore)\b|\bconcurrent\.futures\b", "threads/concurrency"),
     (r"\bmultiprocessing\.(Process|Pool)\b", "multiprocessing"),
-
-    # 随机性
     (r"\brandom\.(random|randint|choice|shuffle|sample)\b|\bnumpy\.random\b|\buuid\.uuid4\b", "randomness"),
-
-    # 网络/外部依赖
     (r"\brequests\.\w+\(|\bhttpx\.\w+\(|\baiohttp\.\w+\(|\burllib\.request\.\w+\(|\bsocket\.", "network-io"),
     (r"\bboto3\b|\bredis\b|\bpika\b|\bkafka\b|\belasticsearch\b|\bpsycopg2\b|\bsqlalchemy\.create_engine\b", "external service/db"),
-
-    # 文件系统 / 临时目录
     (r"\bopen\(|\bpathlib\.Path\b|\bos\.path\b|\btempfile\b|\bshutil\.", "fs-io"),
-
-    # 系统时间 / 时区
     (r"\btime\.(time|monotonic)\(|\bdatetime\.(now|utcnow|today)\(", "clock"),
     (r"\bfreezegun\.", "time-freeze"),
-
-    # 环境/配置
     (r"\bos\.environ\b|\bos\.getenv\(", "env/config"),
     (r"\bmonkeypatch\.(setenv|setitem|setattr)\b", "monkeypatching"),
-
-    # 执行顺序依赖
     (r"\bpytest\.mark\.order\b|\bpytest-order\b", "order-dependence"),
-
-    # 外部进程 / UI
     (r"\bsubprocess\.(run|Popen|check_call|check_output)\b", "subprocess/external"),
     (r"\bselenium\.webdriver\b|\bplaywright\.", "ui/webdriver"),
 ]
+
+_HINT_PATTERNS_JAVA = [
+    (r"\bThread\.sleep\b|\bTimeUnit\.\w+\.sleep\b|\bAwaitility\b", "timing/sleep"),
+    (r"\bFuture\b|\bCompletableFuture\b|\bExecutor(Service)?\b|\bForkJoinPool\b", "async/concurrency"),
+    (r"@Order|@FixMethodOrder|dependsOnMethods", "order-dependence"),
+    (r"\bRandom\b|\bMath\.random\b", "randomness"),
+    (r"\bHttp(Client|URLConnection)\b|\bSocket\b|\bOkHttp\b|\bRestTemplate\b|\bWebClient\b", "network-io"),
+    (r"\bFile(Input|Output)Stream\b|\bPaths?\b|\bFiles\b", "fs-io"),
+    (r"\bSystem\.currentTimeMillis\b|\bClock\b|\bInstant\.now\b", "clock"),
+    (r"\bvolatile\b|\bsynchronized\b|\bwait\(|\bnotify\(", "locks/wait-notify"),
+    (r"\bSystem\.getenv\b|\bSystem\.getProperty\b|(?:^|\s)-D\w+", "env/config"),
+    (r"\bMockito\.(when|verify|spy|mock)\b|\bPowerMockito\b", "mocks"),
+    (r"\bSelenium\b|\bWebDriver\b", "ui/webdriver"),
+]
+
+def _patterns_for_kind():
+    return _HINT_PATTERNS_PY if DATASET_KIND == "python" else _HINT_PATTERNS_JAVA
 
 def _auto_hint(code: str) -> str:
     if not USE_AUTO_HINT or not code:
         return ""
     tags = []
-    for pat, name in _HINT_PATTERNS:
+    for pat, name in _patterns_for_kind():
         try:
-            if re.search(pat, code, flags=re.I):   # <= 加 re.I
+            if re.search(pat, code, flags=re.I):
                 tags.append(name)
         except re.error:
             pass
@@ -236,7 +290,6 @@ def _auto_hint(code: str) -> str:
         return ""
     text = " HINT: " + ", ".join(tags) + "."
     return text[:MAX_AUTO_HINT_CHARS]
-
 
 def build_input_with_prompt(code_text: str) -> str:
     code_text = code_text or ""
@@ -291,7 +344,7 @@ def encode_chunks_per_texts(
                     attn += [0] * pad_len
                 chunk_inputs.append((torch.tensor(piece_ids, dtype=torch.long),
                                      torch.tensor(attn, dtype=torch.long)))
-                if len(chunk_inputs) >= cap_chunks:   # ### [CHANGE] 截顶
+                if len(chunk_inputs) >= cap_chunks:
                     break
 
         X_ids  = torch.stack([ci[0] for ci in chunk_inputs], dim=0)   # [C,L]
@@ -381,7 +434,7 @@ def smote_like_oversample(texts: np.ndarray, labels: np.ndarray,
 
 
 # -----------------------
-# 分桶 BatchSampler：每个 epoch 打乱  ### [CHANGE]
+# 分桶 BatchSampler：每个 epoch 打乱
 # -----------------------
 class BucketedBatchSampler(Sampler):
     def __init__(self, lengths, batch_size: int, seed: int = 42):
@@ -391,11 +444,9 @@ class BucketedBatchSampler(Sampler):
         self.base_seed = seed
 
     def __iter__(self):
-        # 划分批
         batches = [self.idx_sorted[i:i+self.batch_size] for i in range(0, len(self.idx_sorted), self.batch_size)]
-        rng = random.Random(self.base_seed + int(time.time()) % 100000)  # 每次迭代打乱顺序
+        rng = random.Random(self.base_seed + int(time.time()) % 100000)
         rng.shuffle(batches)
-        # 批内也洗牌
         batches = [list(b) for b in batches]
         for b in batches:
             rng.shuffle(b)
@@ -406,7 +457,7 @@ class BucketedBatchSampler(Sampler):
 
 
 # -----------------------
-# AMP 兼容封装  ### [CHANGE]
+# AMP 兼容封装
 # -----------------------
 def _make_grad_scaler(enabled: bool):
     try:
@@ -435,7 +486,7 @@ class AutocastCUDA:
 
 
 # -----------------------
-# 模型（微批上卡 + 池化）
+# 模型（微批上卡 + 池化 + 两层 MLP 头）
 # -----------------------
 class ChunkedClassifier(nn.Module):
     def __init__(self, model_name: str, num_labels: int = 2, agg: str = "mean",
@@ -446,7 +497,13 @@ class ChunkedClassifier(nn.Module):
             self.encoder.gradient_checkpointing_enable()
 
         hidden = self.encoder.config.hidden_size
-        self.classifier = nn.Linear(hidden, num_labels)
+        # 两层 MLP 头：768→512→2（GELU+Dropout）
+        self.head = nn.Sequential(
+            nn.Linear(hidden, HEAD_HIDDEN),
+            nn.GELU(),
+            nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(HEAD_HIDDEN, num_labels),
+        )
         assert agg in {"mean", "max"}
         self.agg = agg
         self.micro_chunk = micro_chunk
@@ -513,7 +570,7 @@ class ChunkedClassifier(nn.Module):
             start = end
 
         pooled = pooled_sum / pooled_cnt.clamp(min=1e-6) if self.agg == "mean" else pooled_max
-        logits = self.classifier(pooled)
+        logits = self.head(pooled)  # 改为两层 MLP 头
         return logits
 
 
@@ -534,21 +591,18 @@ def compute_scores(tn, fp, fn, tp):
 # -----------------------
 def main():
     print(f"[{now()}] 设备：{device}")
+    print(f"[{now()}] DATASET_KIND = {DATASET_KIND}")
     df = load_dataset_any(dataset_path)
 
-    code_col = "ExtractedCode" if "ExtractedCode" in df.columns else ("final_code" if "final_code" in df.columns else None)
-    if code_col is None:
-        raise ValueError("未找到代码列（期望 ExtractedCode 或 final_code）")
-    if "flaky" not in df.columns:
-        raise ValueError("未找到标签列 flaky")
-    print(f"[{now()}] 使用代码列：{code_col}")
+    code_col, label_col = pick_cols(df, DATASET_KIND)
+    print(f"[{now()}] 使用代码列：{code_col} | 标签列：{label_col}")
 
-    # 文本提示拼接  ### [CHANGE]
+    # 文本（提示 + 自动提示）
     codes = df[code_col].fillna("").astype(str)
     X = codes.map(build_input_with_prompt).values
 
     # 标签
-    df["label"] = df["flaky"].apply(map_label_merge if MERGE_OD_NOD else map_label_separate).astype(int)
+    df["label"] = df[label_col].apply(map_label_merge if MERGE_OD_NOD else map_label_separate).astype(int)
     y = df["label"].values
     uniq = np.unique(y)
     print(f"[{now()}] 全量标签分布：", {int(v): int((y==v).sum()) for v in uniq})
@@ -586,7 +640,7 @@ def main():
             fold_idx += 1
             continue
 
-        # 过采样（可选）  ### [CHANGE]
+        # 过采样（可选）
         if OVERSAMPLE_METHOD == "smote_like":
             X_train_os, y_train_os = smote_like_oversample(
                 X_train, y_train,
@@ -596,14 +650,20 @@ def main():
                 random_state=SEED
             )
             print(f"[{now()}] SMOTE-like 后：train={len(X_train_os)} | pos={int((y_train_os==1).sum())} neg={int((y_train_os==0).sum())}")
+            class_weights = np.array([1.0, 1.0], dtype=np.float32)  # 避免与过采样叠加
         elif OVERSAMPLE_METHOD == "ros":
             ros = RandomOverSampler(sampling_strategy=min(1.0, TARGET_POS_RATIO), random_state=SEED)
             X_train_os, y_train_os = ros.fit_resample(X_train.reshape(-1,1), y_train.reshape(-1,1))
             X_train_os = X_train_os.ravel(); y_train_os = y_train_os.ravel()
             print(f"[{now()}] ROS 后：train={len(X_train_os)} | pos={int((y_train_os==1).sum())} neg={int((y_train_os==0).sum())}")
+            class_weights = np.array([1.0, 1.0], dtype=np.float32)
         else:
             X_train_os, y_train_os = X_train, y_train
             print(f"[{now()}] 不做过采样：train={len(X_train_os)} | pos={int((y_train_os==1).sum())} neg={int((y_train_os==0).sum())}")
+            try:
+                class_weights = compute_class_weight('balanced', classes=np.array([0,1]), y=y_train)
+            except Exception:
+                class_weights = np.array([1.0, 1.0], dtype=np.float32)
 
         # 分块 & 截顶
         train_chunks = encode_chunks_per_texts(list(X_train_os), tokenizer, MAX_LEN, WINDOW_OVERLAP_TOKENS, MAX_CHUNKS_PER_SAMPLE)
@@ -620,7 +680,7 @@ def main():
         train_lengths = [d["input_ids"].size(0) for d in train_chunks]
         train_batch_sampler = BucketedBatchSampler(train_lengths, BATCH_TRAIN, seed=SEED)
 
-        # DataLoader（CPU 常驻，不整体上卡）
+        # DataLoader（CPU 常驻）
         g = torch.Generator(); g.manual_seed(SEED)
         train_loader = DataLoader(train_ds, batch_sampler=train_batch_sampler,
                                   generator=g, num_workers=0, collate_fn=collate_owner_batch)
@@ -635,17 +695,11 @@ def main():
         model = ChunkedClassifier(MODEL_NAME, num_labels=2, agg=AGG_METHOD,
                                   micro_chunk=MICRO_CHUNK, use_checkpoint=True).to(device)
 
-        # 类权重（基于未过采样 y_train）
-        classes = np.array([0, 1])
-        try:
-            class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
-        except Exception as e:
-            class_weights = np.array([1.0, 1.0], dtype=np.float32)
-            print(f"[{now()}] [WARN] compute_class_weight 失败，使用均等权重。{e}")
+        # 损失（类权重）
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
         print(f"[{now()}] 类权重：{class_weights.tolist()}")
-
         criterion = nn.CrossEntropyLoss(weight=weight_tensor, reduction="mean")
+
         optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
         # AMP / TF32
@@ -654,9 +708,23 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+        # ====== 学习率调度 ======
+        updates_per_epoch = math.ceil(len(train_loader) / max(1, GRAD_ACC_STEPS))
+        total_updates = max(1, updates_per_epoch * EPOCHS)
+        warmup_steps = int(WARMUP_RATIO * total_updates)
+        if SCHEDULER.lower().startswith("cos"):
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
+            )
+        else:
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
+            )
+
         best_val_f1 = -1.0
         best_state = None
         best_thr_for_fold = 0.5
+        no_improve = 0
 
         # 训练
         for epoch in range(EPOCHS):
@@ -694,6 +762,7 @@ def main():
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
+                    scheduler.step()                          # ← 每次参数更新后调度
                     optimizer.zero_grad(set_to_none=True)
 
                 tr_loss += loss.item() * GRAD_ACC_STEPS
@@ -707,7 +776,7 @@ def main():
             tr_loss /= max(1, len(train_loader))
             train_acc = train_correct / max(1, train_total)
 
-            # ===== 验证：阈值扫描（0.05~0.95 步长 0.05）  ### [CHANGE]
+            # ===== 验证：阈值扫描（先粗后细）
             model.eval()
             y_val_true, y_val_prob = [], []
             with torch.no_grad():
@@ -724,6 +793,7 @@ def main():
             y_val_true = np.array(y_val_true)
             y_val_prob = np.array(y_val_prob)
 
+            # 粗扫
             cand_thresh = np.linspace(0.05, 0.95, 19)
             f1_list = []
             for t in cand_thresh:
@@ -732,8 +802,22 @@ def main():
                 _, f1_t, _, _ = compute_scores(tn, fp, fn, tp)
                 f1_list.append(f1_t)
             best_idx = int(np.argmax(f1_list))
-            THRESH_FOLD = float(cand_thresh[best_idx])
+            thr_coarse = float(cand_thresh[best_idx])
 
+            # 细扫（±0.05，步长 0.01）
+            lo = max(0.01, thr_coarse - 0.05)
+            hi = min(0.99, thr_coarse + 0.05)
+            cand_fine = np.linspace(lo, hi, int(round((hi-lo)/0.01))+1)
+            f1_best = -1.0
+            thr_best = thr_coarse
+            for t in cand_fine:
+                pred = (y_val_prob >= t).astype(int)
+                tn, fp, fn, tp = confusion_matrix(y_val_true, pred, labels=[0,1]).ravel()
+                _, f1_t, _, _ = compute_scores(tn, fp, fn, tp)
+                if f1_t > f1_best:
+                    f1_best = float(f1_t); thr_best = float(t)
+
+            THRESH_FOLD = thr_best
             y_val_pred = (y_val_prob >= THRESH_FOLD).astype(int)
             tn, fp, fn, tp = confusion_matrix(y_val_true, y_val_pred, labels=[0,1]).ravel()
             acc, f1, prec, rec = compute_scores(tn, fp, fn, tp)
@@ -745,11 +829,18 @@ def main():
                   f"val_acc={acc:.4f} val_f1={f1:.4f} p={prec:.4f} r={rec:.4f} | "
                   f"best_thr={THRESH_FOLD:.2f} | pred_pos_rate={pos_rate_pred:.4%} | {elapse:.1f}s")
 
-            if f1 > best_val_f1:
+            # Early Stopping（看 val F1）
+            if f1 > best_val_f1 + MIN_DELTA:
                 print(f"[{now()}]   🎯 新最佳验证 F1：{best_val_f1:.4f} -> {f1:.4f}（保存权重）")
                 best_val_f1 = f1
                 best_thr_for_fold = THRESH_FOLD
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= PATIENCE:
+                    print(f"[{now()}]   ⛳ 提前停止：连续 {PATIENCE} 个 epoch 无明显提升（Δ<{MIN_DELTA}）")
+                    break
 
             gc.collect()
             if torch.cuda.is_available():
@@ -761,9 +852,9 @@ def main():
         torch.save(model.state_dict(), model_weights_path)
         print(f"[{now()}] 已保存本折最佳权重：{model_weights_path} | 使用阈值：{best_thr_for_fold:.2f}")
 
-        # ===== 测试：沿用验证最优阈值  ### [CHANGE]
+        # ===== 测试：沿用验证最优阈值
         model.eval()
-        y_test_pred, y_test_prob = [], []
+        y_test_pred = []
         with torch.no_grad():
             for batch in test_loader:
                 ids, attn, c_mask, labels = batch
@@ -771,7 +862,6 @@ def main():
                 with AutocastCUDA(torch.bfloat16 if use_bf16_amp else torch.float16):
                     logits = model(ids, attn, c_mask)
                     probs = torch.softmax(logits, dim=-1)[:,1].detach().cpu().numpy()
-                y_test_prob.extend(probs.tolist())
                 y_test_pred.extend((probs >= best_thr_for_fold).astype(int).tolist())
                 del ids, attn, c_mask, labels, logits
 
@@ -797,7 +887,8 @@ def main():
     out = pd.DataFrame([{
         "Accuracy": acc, "F1": f1, "Precision": prec, "Recall": rec,
         "TN": TN, "FP": FP, "FN": FN, "TP": TP,
-        "PosRate_All": base_pos_rate
+        "PosRate_All": base_pos_rate,
+        "DatasetKind": DATASET_KIND
     }])
     out.to_csv(results_file, index=False)
     print(f"[{now()}] OVERALL  acc={acc:.4f} f1={f1:.4f} p={prec:.4f} r={rec:.4f} | "
