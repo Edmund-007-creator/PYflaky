@@ -4,10 +4,16 @@
 # 显存管理（2.4.x 稳定）
 # =========================
 import os
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True"
-)
+
+# ---- 强制移除/覆盖 expandable_segments:True ----
+_default_alloc_conf = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", _default_alloc_conf)
+# 去掉任何包含 expandable_segments 的片段
+_conf = ",".join([p for p in _conf.split(",") if not p.strip().startswith("expandable_segments") and p.strip() != ""])
+if not _conf:
+    _conf = _default_alloc_conf
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _conf
+# ----------------------------------------------
 
 import sys, math, gc, random, time, inspect, re
 import numpy as np
@@ -45,7 +51,7 @@ REPO_DIR = Path(__file__).resolve().parent
 BASE_DIR = Path(os.getenv("PYFLAKY_HOME", REPO_DIR))
 
 MODEL_NAME = os.getenv("MODEL_NAME", str(BASE_DIR / "models" / "graphcodebert-base"))
-DATASET_PATH = Path(os.getenv("DATASET_PATH", str(BASE_DIR / "dataset" / "Flakify_FlakeFlagger_dataset.csv")))
+DATASET_PATH = Path(os.getenv("DATASET_PATH", str(BASE_DIR / "dataset" / "python_dataset_generated.xlsx")))
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,7 +77,7 @@ MAX_LEN    = int(os.getenv("MAX_LEN", 512))
 WINDOW_OVERLAP_TOKENS = int(os.getenv("WINDOW_OVERLAP_TOKENS", 256))
 
 LR        = float(os.getenv("LR", 2e-5))
-EPOCHS    = int(os.getenv("EPOCHS", 15))                 # ↑ 放大到 15，交给 early stopping 控
+EPOCHS    = int(os.getenv("EPOCHS", 5))
 BATCH_TRAIN = int(os.getenv("BATCH_TRAIN", 4))
 BATCH_EVAL  = int(os.getenv("BATCH_EVAL", 8))
 SEED      = int(os.getenv("SEED", 42))
@@ -80,7 +86,7 @@ AGG_METHOD = os.getenv("AGG_METHOD", "mean")   # "mean" | "max"
 MERGE_OD_NOD = (os.getenv("MERGE_OD_NOD", "1") != "0")
 
 # === 不平衡处理（默认只用类权重；需要过采样再改这里） =========================
-OVERSAMPLE_METHOD = os.getenv("OVERSAMPLE_METHOD", "none")   # "smote_like" | "ros" | "none"
+OVERSAMPLE_METHOD = os.getenv("OVERSAMPLE_METHOD", "smote_like")   # "smote_like" | "ros" | "none"
 TARGET_POS_RATIO = float(os.getenv("TARGET_POS_RATIO", 0.5)) # 若 smote/ros，用 0.5 更稳
 SVD_DIM = int(os.getenv("SVD_DIM", 256))
 K_NEIGHBORS = int(os.getenv("K_NEIGHBORS", 5))
@@ -107,6 +113,12 @@ MIN_DELTA = float(os.getenv("MIN_DELTA", 1e-3))         # 认为“有提升”�
 # === 新增：两层 MLP 头部超参 ===
 HEAD_HIDDEN = int(os.getenv("HEAD_HIDDEN", 512))
 HEAD_DROPOUT = float(os.getenv("HEAD_DROPOUT", 0.1))
+
+# === 新增：总开关（最少改动的“开关式”） ===
+USE_SCHEDULER = (os.getenv("USE_SCHEDULER", "1") != "0")   # 设为 0 关闭学习率调度
+USE_EARLY_STOP = (os.getenv("USE_EARLY_STOP", "1") != "0") # 设为 0 关闭提前停止
+# （可选）梯度检查点开关（默认保持开启行为）
+USE_CHECKPOINT = (os.getenv("USE_CHECKPOINT", "1") != "0")
 
 
 # -----------------------
@@ -618,18 +630,17 @@ def main():
     print(f"[{now()}] 已加载 tokenizer，model_max_length={tokenizer.model_max_length}")
 
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
-    TN = FP = FN = TP = 0
-    fold_idx = 0
 
-    for train_index, test_index in skf.split(X, y):
+    TN = FP = FN = TP = 0
+    for fold_idx, (train_index, test_index) in enumerate(skf.split(X, y), start=1):
         fold_t0 = time.time()
-        print("\n" + "="*90)
-        print(f"[{now()}] ===== Fold {fold_idx+1}/{N_SPLITS} =====")
+        print("\n" + "=" * 90)
+        print(f"[{now()}] ===== Fold {fold_idx}/{N_SPLITS} =====")
+
         X_train_full, X_test = X[train_index], X[test_index]
         y_train_full, y_test = y[train_index], y[test_index]
         print(f"[{now()}] 原始划分：train={len(X_train_full)}  test={len(X_test)}")
 
-        # 留出验证
         X_train, X_val, y_train, y_val = train_test_split(
             X_train_full, y_train_full, test_size=0.2, stratify=y_train_full, random_state=SEED
         )
@@ -637,7 +648,6 @@ def main():
 
         if len(np.unique(y_train)) < 2:
             print(f"[{now()}] [WARN] 本折训练集只有一个类别，跳过该折。")
-            fold_idx += 1
             continue
 
         # 过采样（可选）
@@ -693,7 +703,7 @@ def main():
 
         # 模型
         model = ChunkedClassifier(MODEL_NAME, num_labels=2, agg=AGG_METHOD,
-                                  micro_chunk=MICRO_CHUNK, use_checkpoint=True).to(device)
+                                  micro_chunk=MICRO_CHUNK, use_checkpoint=USE_CHECKPOINT).to(device)
 
         # 损失（类权重）
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -712,14 +722,17 @@ def main():
         updates_per_epoch = math.ceil(len(train_loader) / max(1, GRAD_ACC_STEPS))
         total_updates = max(1, updates_per_epoch * EPOCHS)
         warmup_steps = int(WARMUP_RATIO * total_updates)
-        if SCHEDULER.lower().startswith("cos"):
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
-            )
-        else:
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
-            )
+
+        scheduler = None
+        if USE_SCHEDULER:
+            if SCHEDULER.lower().startswith("cos"):
+                scheduler = get_cosine_schedule_with_warmup(
+                    optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
+                )
+            else:
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_updates
+                )
 
         best_val_f1 = -1.0
         best_state = None
@@ -762,7 +775,8 @@ def main():
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
-                    scheduler.step()                          # ← 每次参数更新后调度
+                    if scheduler is not None:
+                        scheduler.step()                  # ← 仅在启用调度时推进
                     optimizer.zero_grad(set_to_none=True)
 
                 tr_loss += loss.item() * GRAD_ACC_STEPS
@@ -837,10 +851,12 @@ def main():
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 no_improve = 0
             else:
-                no_improve += 1
-                if no_improve >= PATIENCE:
-                    print(f"[{now()}]   ⛳ 提前停止：连续 {PATIENCE} 个 epoch 无明显提升（Δ<{MIN_DELTA}）")
-                    break
+                if USE_EARLY_STOP:
+                    no_improve += 1
+                    if no_improve >= PATIENCE:
+                        print(f"[{now()}]   ⛳ 提前停止：连续 {PATIENCE} 个 epoch 无明显提升（Δ<{MIN_DELTA}）")
+                        break
+                # 关闭提前停止时，不做任何事，继续训练
 
             gc.collect()
             if torch.cuda.is_available():
@@ -869,14 +885,15 @@ def main():
         print(classification_report(y_test, y_test_pred, digits=4))
         tn, fp, fn, tp = confusion_matrix(y_test, y_test_pred, labels=[0,1]).ravel()
         acc_t, f1_t, prec_t, rec_t = compute_scores(tn, fp, fn, tp)
-        print(f"[{now()}] Fold {fold_idx+1} | test_acc={acc_t:.4f} test_f1={f1_t:.4f} p={prec_t:.4f} r={rec_t:.4f} | "
-              f"CM: TN={tn} FP={fp} FN={fn} TP={tp}")
+
+        print(f"[{now()}] Fold {fold_idx} | test_acc={acc_t:.4f} test_f1={f1_t:.4f} "
+              f"p={prec_t:.4f} r={rec_t:.4f} | CM: TN={tn} FP={fp} FN={fn} TP={tp}")
 
         TN += tn; FP += fp; FN += fn; TP += tp
 
         fold_time = time.time() - fold_t0
-        print(f"[{now()}] 本折耗时：{fold_time/60:.1f} 分钟")
-        print("="*90)
+        print(f"[{now()}] 本折耗时：{fold_time / 60:.1f} 分钟")
+        print("=" * 90)
 
         del model; gc.collect()
         if torch.cuda.is_available():
